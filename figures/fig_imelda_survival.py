@@ -1,3 +1,4 @@
+"""Make plots showing survival curves for outages near and far from flooded roads during Imelda."""
 import datetime
 import pandas as pd
 import helpers
@@ -11,10 +12,12 @@ sb.set("paper", font_scale=1.9)
 fig_w, fig_h = (5.5, 5.5)
 
 
-def plot_simplified_survival_curve(df_power_storm, df_prev60):
+def plot_simplified_survival_curve(
+    df_power_storm, df_prev60, km_cuts=[0, 5, 30, 10000]
+):
 
     df_power_storm = helpers.add_distance_partition_by_nearest_flooded_road(
-        df_power_storm, [0, 5, 30, 10000]
+        df_power_storm, km_cuts
     )
 
     kmflist = helpers.kmf_curves_by_distance_partition(df_power_storm)
@@ -40,10 +43,10 @@ def plot_simplified_survival_curve(df_power_storm, df_prev60):
     plt.savefig("imelda_survival_simplified.pdf")
 
 
-def plot_imelda_survival(df_power_storm):
+def plot_imelda_survival(df_power_storm, km_cuts=[0, 2, 5, 10, 20, 10000]):
     # partition the data
     df_power_storm = helpers.add_distance_partition_by_nearest_flooded_road(
-        df_power_storm, [0, 2, 5, 10, 20, 10000]
+        df_power_storm, km_cuts
     )
     kmflist = helpers.kmf_curves_by_distance_partition(df_power_storm)
     f = plt.figure(figsize=(fig_w, fig_h))
@@ -81,11 +84,10 @@ def plot_imelda_distance_duration(df_power_storm):
 
 
 def plot_imelda_elastic_near_far(df_power_storm):
-    
     def get_near_far_data_to_plot(df_power_storm, d):
         df = df_power_storm[
-        df_power_storm.util.isin(["centerpoint_tx", "entergy_latxak"])
-    ].set_index(["util", "index_copy"])
+            df_power_storm.util.isin(["centerpoint_tx", "entergy_latxak"])
+        ].set_index(["util", "index_copy"])
         dfclose = df[(df.closest_flooded_road_dist < d)]
         dfnotclose = df[(df.closest_flooded_road_dist >= d)]
         dfstartclose = helpers.get_outages_per_hour(dfclose, "2H")
@@ -152,6 +154,7 @@ def plot_imelda_elastic_near_far(df_power_storm):
             plt.savefig(figstyle + ".png")
             plt.savefig(figstyle + ".pdf")
 
+
 if __name__ == "__main__":
 
     df_roads = helpers.load_tx_511_imelda_df()
@@ -172,7 +175,7 @@ if __name__ == "__main__":
     df_power_storm = helpers.add_closest_flooded_roads(df_roads, df_power_storm)
     df_roads = helpers.add_outage_details_to_df_roads(df_roads, df_power_storm)
 
-    plot_simplified_survival_curve(df_power_storm, df_prev60)
-    plot_imelda_survival(df_power_storm)
+    plot_simplified_survival_curve(df_power_storm, df_prev60, [0, 5, 30, 10000])
+    plot_imelda_survival(df_power_storm, [0, 2, 5, 10, 20, 10000])
     plot_imelda_distance_duration(df_power_storm)
     plot_imelda_elastic_near_far(df_power_storm)
