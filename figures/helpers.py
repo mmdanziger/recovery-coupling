@@ -8,13 +8,16 @@ import statsmodels.api as sm
 from scipy.signal import savgol_filter
 import mercantile
 from matplotlib import colors
-from haversine import haversine,Unit
+from haversine import haversine, Unit
 import tqdm
 from lifelines import KaplanMeierFitter
+import matplotlib.pyplot as plt
+from matplotlib import colors
 
 DATA_FILENAME = "outages_util_2H_Aug12_2020.csv"
 IMELDA_ROADS_FILENAME = "tx_511.csv"
 IMELDA_COUNTIES_OUTAGES = "imelda_counties_outages_to_Jul06_2020.csv"
+
 
 def load_dfstart(fname: Optional[str] = None) -> pd.DataFrame:
     if fname is None:
@@ -25,7 +28,7 @@ def load_dfstart(fname: Optional[str] = None) -> pd.DataFrame:
     return dfstart
 
 
-def load_tx_511_imelda_df(fname: Optional[str] = None) -> pd.DataFrame:
+def load_tx_511_imelda_df(fname: Optional[str] = None, aggregate_to_patch=True) -> pd.DataFrame:
     if fname is None:
         fname = os.path.join(
             os.path.dirname(__file__), "..", "data", IMELDA_ROADS_FILENAME
@@ -37,35 +40,48 @@ def load_tx_511_imelda_df(fname: Optional[str] = None) -> pd.DataFrame:
         )
     ]
     df_roads_tag = add_spatial_index_column(df_roads_tag)
-    aggdict = {
-        "start_timestamp": "min",
-        "end_timestamp": "max",
-        "lat": "mean",
-        "lng": "mean",
-    }
-    df_roads_tag.groupby("spatial_index").agg(aggdict)
-    df_roads_tag = df_roads_tag.reset_index()
+    if aggregate_to_patch:
+        aggdict = {
+            "start_timestamp": "min",
+            "end_timestamp": "max",
+            "lat": "mean",
+            "lng": "mean",
+        }
+        df_roads_tag.groupby("spatial_index").agg(aggdict)
+        df_roads_tag = df_roads_tag.reset_index()
     return df_roads_tag
+
 
 def load_imelda_power_df(fname: Optional[str] = None) -> pd.DataFrame:
     if fname is None:
         fname = os.path.join(
             os.path.dirname(__file__), "..", "data", IMELDA_COUNTIES_OUTAGES
         )
-    df = pd.read_csv(fname,
-                     dtype={"spatial_index": str, "end_timestamp": int, "incid": str, "block": str, "block_group": str},
-                     low_memory=False)
+    df = pd.read_csv(
+        fname,
+        dtype={
+            "spatial_index": str,
+            "end_timestamp": int,
+            "incid": str,
+            "block": str,
+            "block_group": str,
+        },
+        low_memory=False,
+    )
     df = df.rename(columns={"Unnamed: 0": "util"})
     df = df.set_index(["util", "index_copy"])
     df["start_timestamp_observed"] = [int(i[1].split("_")[0]) for i in df.index]
     df["start_timestamp_reported"] = df["start_timestamp"].values
-    df = df.loc[["centerpoint_tx","entergy_latxak"]]
+    df = df.loc[["centerpoint_tx", "entergy_latxak"]]
     df.end_timestamp = df.end_timestamp.apply(int)
     df.start_timestamp = df.start_timestamp.apply(int)
-    timestring = lambda x: datetime.datetime.fromtimestamp(x).strftime("%Y-%m-%dT%H:%M:%S")
+    timestring = lambda x: datetime.datetime.fromtimestamp(x).strftime(
+        "%Y-%m-%dT%H:%M:%S"
+    )
     df["start_timestring"] = df.start_timestamp.apply(timestring)
     df["end_timestring"] = df.end_timestamp.apply(timestring)
     return df
+
 
 def non_zero_bounds(x, y):
     return [min(x[x > 0]), max(x), min(y[y > 0]), max(y)]
@@ -167,7 +183,7 @@ def get_neighboring_keys(qk, include_self=True):
 
 def add_spatial_index_column(df, overwrite=False, zoom=19):
     if "spatial_index" not in df.columns:
-        df["spatial_index"] = ""
+        df = df.assign(spatial_index="")
     if not overwrite:
         df.loc[
             ((df.spatial_index == "") | (df.spatial_index.isna())) & ~df.lat.isna(),
@@ -185,13 +201,16 @@ def add_spatial_index_column(df, overwrite=False, zoom=19):
         )
     return df
 
+
 def add_zoom_column(df, z=11):
     has_spatial_index = ~df.spatial_index.isna() & ~(df.spatial_index == "")
-    df.loc[has_spatial_index, "spatial_index_z%i" % z] = df.loc[has_spatial_index, "spatial_index"].transform(
-        lambda x: x[:z] if len(x) > z else "")
+    df.loc[has_spatial_index, "spatial_index_z%i" % z] = df.loc[
+        has_spatial_index, "spatial_index"
+    ].transform(lambda x: x[:z] if len(x) > z else "")
     not_enough_z = (df["spatial_index_z%i" % z] == "") & ~df.lat.isna()
     df.loc[not_enough_z, "spatial_index_z%i" % z] = df.loc[not_enough_z].apply(
-        lambda x: mercantile.quadkey(mercantile.tile(x["lng"], x["lat"], z)), axis=1)
+        lambda x: mercantile.quadkey(mercantile.tile(x["lng"], x["lat"], z)), axis=1
+    )
     return df
 
 
@@ -288,59 +307,249 @@ def get_outages_per_hour(df, freq="H", window_size=3):
     ) / startend.events.std()
     return startend
 
-def calc_distances(row,z,dfz):
-    close = dfz[dfz["spatial_index_z%i"%z].isin(get_neighboring_keys(row["spatial_index"][:z]))]
-    time_overlap = close[(close.start_timestamp < row["end_timestamp"]) & (close.end_timestamp > row["start_timestamp"])]
-    out=[]
-    for idx,other_row in time_overlap.iterrows():
-        d=haversine(other_row[["lat","lng"]],row[["lat","lng"]],unit=Unit.KILOMETERS)
-        out.append((idx,d))
+
+def get_full_event_sequence(subdf, stepsize=300, include_maxevents=False):
+    mintime = subdf.start_timestamp.min()
+    roundint = lambda x: round(int(x))
+    starts = ((subdf.start_timestamp - mintime) / stepsize).apply(roundint)
+    ends = ((subdf.end_timestamp - mintime) / stepsize).apply(roundint)
+    vecN = max(starts.max(), ends.max()) + 1
+    events = np.zeros(vecN)
+    times = [mintime + i * stepsize for i in range(vecN)]
+    for i in starts.values:
+        events[i] += 1
+    for i in ends.values:
+        events[i] -= 1
+    events = np.cumsum(events)
+    if include_maxevents:
+        maxevents = []
+        for i, j in zip(starts.values, ends.values):
+            maxevents.append(max(events[i:j]))
+        return times, events, maxevents
+    else:
+        return times, events
+
+
+def calc_distances(row, z, dfz):
+    close = dfz[
+        dfz["spatial_index_z%i" % z].isin(
+            get_neighboring_keys(row["spatial_index"][:z])
+        )
+    ]
+    time_overlap = close[
+        (close.start_timestamp < row["end_timestamp"])
+        & (close.end_timestamp > row["start_timestamp"])
+    ]
+    out = []
+    for idx, other_row in time_overlap.iterrows():
+        d = haversine(
+            other_row[["lat", "lng"]], row[["lat", "lng"]], unit=Unit.KILOMETERS
+        )
+        out.append((idx, d))
     return out
 
 
 def kmffit(dvec):
-    kmf=KaplanMeierFitter()
+    kmf = KaplanMeierFitter()
     kmf.fit(dvec)
     return kmf
 
-def add_closest_flooded_roads(df_roads, df_power_storm,     scanning_z=11):
-    #Calculate the nearest flooded road for each outage
-    df_power_storm = add_zoom_column(df_power_storm,scanning_z)
-    distmatrix = np.zeros( (len(df_roads),len(df_power_storm)) ) + 10000
-    for i in tqdm.tqdm(range(len(df_roads))):
-        dists=calc_distances(df_roads.loc[i],scanning_z,df_power_storm)
-        for j,d in dists:
-            distmatrix[i,j] = d
 
-    dmins = np.array([(i,distmatrix[:,i].argmin(),distmatrix[:,i].min()) for i in range(distmatrix.shape[1])])
-    closest_flooded_road_dist = dmins[:,2]
-    closest_flooded_road = dmins[:,1].astype(int)
+def add_closest_flooded_roads(df_roads, df_power_storm, scanning_z=11):
+    # Calculate the nearest flooded road for each outage
+    df_power_storm = add_zoom_column(df_power_storm, scanning_z)
+    distmatrix = np.zeros((len(df_roads), len(df_power_storm))) + 10000
+    for i in tqdm.tqdm(range(len(df_roads))):
+        dists = calc_distances(df_roads.loc[i], scanning_z, df_power_storm)
+        for j, d in dists:
+            distmatrix[i, j] = d
+
+    dmins = np.array(
+        [
+            (i, distmatrix[:, i].argmin(), distmatrix[:, i].min())
+            for i in range(distmatrix.shape[1])
+        ]
+    )
+    closest_flooded_road_dist = dmins[:, 2]
+    closest_flooded_road = dmins[:, 1].astype(int)
     df_power_storm["closest_flooded_road_dist"] = closest_flooded_road_dist
     df_power_storm["closest_flooded_road"] = closest_flooded_road
     return df_power_storm
 
+
 def add_outage_details_to_df_roads(df_roads, df_power_storm):
-    dfz_gb_roadidx = df_power_storm[df_power_storm.closest_flooded_road_dist < 10000].groupby("closest_flooded_road").agg({"durationh":["median","mean","count"]})
-    dfz_gb_roadidx.columns = ["outage_duration_median","outage_duration_mean","outage_count"]
+    dfz_gb_roadidx = (
+        df_power_storm[df_power_storm.closest_flooded_road_dist < 10000]
+        .groupby("closest_flooded_road")
+        .agg({"durationh": ["median", "mean", "count"]})
+    )
+    dfz_gb_roadidx.columns = [
+        "outage_duration_median",
+        "outage_duration_mean",
+        "outage_count",
+    ]
 
     df_roads = add_spatial_index_column(df_roads)
     df_roads = df_roads.join(dfz_gb_roadidx)
     return df_roads
 
+
 def add_distance_partition_by_nearest_flooded_road(df_power_storm, km_cuts):
-    km_cut_labels = ["%i - %i"%(km_cuts[i],km_cuts[i+1]) for i in range(len(km_cuts) -2) ]
-    km_cut_labels.append("> %i"%km_cuts[-2] )
-    df_power_storm["distance_partition"] = pd.cut(df_power_storm.closest_flooded_road_dist,km_cuts, labels=km_cut_labels)
+    km_cut_labels = [
+        "%i - %i" % (km_cuts[i], km_cuts[i + 1]) for i in range(len(km_cuts) - 2)
+    ]
+    km_cut_labels.append("> %i" % km_cuts[-2])
+    df_power_storm["distance_partition"] = pd.cut(
+        df_power_storm.closest_flooded_road_dist, km_cuts, labels=km_cut_labels
+    )
     return df_power_storm
 
+
 def kmf_curves_by_distance_partition(df_power_storm):
-    return {part : kmffit(durations_by_partition(df_power_storm, part)) for part in df_power_storm.distance_partition.unique()}
+    return {
+        part: kmffit(durations_by_partition(df_power_storm, part))
+        for part in df_power_storm.distance_partition.unique()
+    }
+
 
 def durations_by_partition(df, part):
-    return df[df.distance_partition==part].durationh.values
+    return df[df.distance_partition == part].durationh.values
+
 
 def get_divnorm():
     try:
         return colors.TwoSlopeNorm(1, vmin=0, vmax=2)
     except AttributeError:
         return colors.DivergingNorm(vmin=0, vcenter=1, vmax=2)
+
+
+def plot_left_linear(
+    dfstart: pd.DataFrame, util: str, quantile=0.7, zoom_version=False, scatter=True
+):
+    """Plot the elastic portion of the outage-repair response curve
+
+    Args:
+        dfstart (pd.DataFrame): df of outages aggregated by util and time window
+        util (str): utility to examine
+        quantile (float, optional): quantile defining elastic region. Defaults to 0.7.
+        zoom_version (bool, optional): plot elastic region only. Defaults to False.
+        scatter (bool, optional): include scatter plot of all outage-time-windows. Defaults to True.
+    """
+
+    dfxy, all_X, elastic_X = get_elastic_predictions(dfstart, util, quantile)
+    divnorm = get_divnorm()
+    if scatter:
+        plt.scatter(
+            dfxy.X, dfxy.Y, c=dfxy.Y_diff, norm=divnorm, cmap="coolwarm_r", alpha=0.85
+        )
+        if not zoom_version:
+            plt.colorbar().set_label(
+                "actual repairs / elastic prediction", rotation=270, labelpad=25
+            )
+    X_elastic = dfxy[dfxy.X < dfxy.X.quantile(quantile)].X
+    Y_pred_elastic = dfxy[dfxy.X < dfxy.X.quantile(quantile)].Y_pred
+    plt.plot(
+        X_elastic, Y_pred_elastic, lw=2, color="darkblue", ls="-", alpha=0.6, zorder=5
+    )
+    if len(elastic_X) < len(all_X):
+        X_postelastic = dfxy[dfxy.X >= dfxy.X.quantile(quantile)].X
+        Y_pred_postelastic = dfxy[dfxy.X >= dfxy.X.quantile(quantile)].Y_pred
+        plt.plot(
+            X_postelastic,
+            Y_pred_postelastic,
+            lw=2,
+            color="darkblue",
+            ls=(0, (1, 10)),
+            alpha=0.6,
+            zorder=5,
+        )
+    plt.ylim(ymin=0, ymax=dfxy.Y.max())
+    plt.xlim(xmin=0)
+    plt.xlabel("Outages/2H")
+    plt.ylabel("Repairs/2H")
+
+    if zoom_version:
+        plt.axis([0, dfxy.X.quantile(quantile), 0, dfxy.Y.quantile(quantile)])
+
+    plt.tight_layout()
+    plt.xlim(xmin=0)
+    plt.ylim(ymin=0)
+    return dfxy
+
+def get_elastic_predictions(dfstart, util, quantile):
+    X = dfstart.loc[util].rollingevents
+    Y = dfstart.loc[util].rollingends
+    nanindex = X.isna() | Y.isna()
+    dfxy = pd.DataFrame([X, Y]).T
+    dfxy.columns = ["X", "Y"]
+    Xf = dfxy[~nanindex & (dfxy.X < dfxy.X.quantile(quantile))]["X"].values
+    Yf = dfxy[~nanindex & (dfxy.X < dfxy.X.quantile(quantile))]["Y"].values
+    print((Xf.shape, Yf.shape))
+    res = sm.OLS(Yf, sm.add_constant(Xf)).fit()
+    dfxy["Y_pred"] = sm.add_constant(dfxy["X"].values) @ res.params
+    dfxy["Y_diff"] = dfxy.Y / dfxy.Y_pred
+    dfxy["Y_diff_sign"] = np.sign(dfxy.Y_diff)
+    dfxy = dfxy.sort_values("X")
+    return dfxy, X, Xf
+
+def spline_fit(X,y,eidx):
+    import scipy.interpolate as si
+    from sklearn.base import TransformerMixin
+    from sklearn.pipeline import make_pipeline
+    from sklearn.linear_model import LinearRegression, RANSACRegressor,\
+                                    TheilSenRegressor, HuberRegressor
+    from sklearn.model_selection import RepeatedKFold,cross_val_score
+
+    from sklearn.metrics import mean_squared_error
+    def get_bspline_basis(knots, degree=3, periodic=False):
+        """Get spline coefficients for each basis spline."""
+        nknots = len(knots)
+        y_dummy = np.zeros(nknots)
+
+        knots, coeffs, degree = si.splrep(knots, y_dummy, k=degree,
+                                        per=periodic)
+        ncoeffs = len(coeffs)
+        bsplines = []
+        for ispline in range(nknots):
+            coeffs = [1.0 if ispl == ispline else 0.0 for ispl in range(ncoeffs)]
+            bsplines.append((knots, coeffs, degree))
+        return bsplines
+
+    class BSplineFeatures(TransformerMixin):
+        def __init__(self, knots, degree=3, periodic=False):
+            self.bsplines = get_bspline_basis(knots, degree, periodic=periodic)
+            self.nsplines = len(self.bsplines)
+
+        def fit(self, X, y=None):
+            return self
+
+        def transform(self, X):
+            nsamples, nfeatures = X.shape
+            features = np.zeros((nsamples, nfeatures * self.nsplines))
+            for ispline, spline in enumerate(self.bsplines):
+                istart = ispline * nfeatures
+                iend = (ispline + 1) * nfeatures
+                features[:, istart:iend] = si.splev(X, spline)
+            return features
+    # Make sure that X is 2D
+    
+    X= X.flatten().reshape((-1,1))
+    x_predict = np.linspace(1, max(X), 1000).reshape((-1,1))
+
+    # predict y
+    knots = np.quantile(X,np.linspace(1e-5, 1-1e-5,20))
+    bspline_features = BSplineFeatures(knots, degree=3, periodic=False)
+    estimators = [('Least-Square', '-', 'C0',
+                LinearRegression(fit_intercept=False)),
+                ('Theil-Sen', '>', 'C1', TheilSenRegressor()),
+                ('RANSAC', '<', 'C2', RANSACRegressor()),
+                ('HuberRegressor', '--', 'C3', HuberRegressor(max_iter=5000))]
+
+    model = make_pipeline(bspline_features, estimators[eidx][-1])
+    model.fit(X, y)
+    kfold = RepeatedKFold(n_splits=4)
+    score = cross_val_score(model, X, y, cv=kfold)
+    mse=score.mean()
+    y_predicted = model.predict(x_predict)
+    print((estimators[eidx][0],score.mean(),score.std()))
+    return x_predict,y_predicted, score.mean()
